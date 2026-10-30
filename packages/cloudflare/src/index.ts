@@ -18,6 +18,8 @@
 //   env.WXBOT.get(env.WXBOT.idFromName("muse")).send({...}) / .pull() / .ack([...])
 
 import { DurableObject } from "cloudflare:workers";
+import { handleMcpRequest } from "./mcp.ts";
+import { deliverOnce, readDelivery } from "./mcp-delivery.ts";
 import {
   allowlist,
   createApiHandler,
@@ -153,6 +155,14 @@ export class WxBinding extends DurableObject<Env> {
   async send(req: Omit<SendRequest, "binding">): Promise<void> {
     const binding = await this.binding();
     await sendMessage(await this.liveClient(), await this.allow(), { ...req, binding });
+  }
+
+  async mcpSendOnce(id: string, fingerprint: string, req: Omit<SendRequest, "binding">) {
+    return deliverOnce(this.ctx.storage, id, fingerprint, () => this.send(req));
+  }
+
+  async mcpDeliveryStatus(id: string) {
+    return readDelivery(this.ctx.storage, id);
   }
 
   async pull(opts: { limit?: number; leaseMs?: number } = {}): Promise<unknown[]> {
@@ -380,6 +390,8 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     if (url.pathname === "/healthz") return new Response("ok\n");
+    const mcp = await handleMcpRequest(req, env);
+    if (mcp) return mcp;
     if (!env.API_TOKEN) return json(500, { error: "API_TOKEN is not configured" });
     if (!safeEqual(req.headers.get("Authorization") ?? "", `Bearer ${env.API_TOKEN}`)) return json(401, { error: "unauthorized" });
     const m = /^\/b\/([^/]+)(\/.*)?$/.exec(url.pathname);
