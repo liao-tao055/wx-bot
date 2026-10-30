@@ -165,7 +165,7 @@ async function sendFile(env: Env, binding: string, to: string, id: string, title
 async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: string): Promise<Obj> {
   if (name === "wechat_status") {
     const st = await stub(env, binding).status();
-    return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES };
+    return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES, last_send: st.last_send ?? null };
   }
   const id = str(a.delivery_id, "delivery_id", 200);
   if (name === "wechat_delivery_status") {

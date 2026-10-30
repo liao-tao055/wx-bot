@@ -131,7 +131,7 @@ export class WxBinding extends DurableObject<Env> {
     const s = await this.session();
     if (!s) throw new WxBotError("expired", "not logged in: POST /login first");
     if (await this.ctx.storage.get(K.expired)) throw new WxBotError("expired", "session expired: POST /login to scan again");
-    const c = new IlinkClient(s);
+    const c = new IlinkClient(s, { recoverStaleContext: true, minSendIntervalMs: 1_000 });
     c.loadTokens((await this.ctx.storage.get<Record<string, string>>(K.tokens)) ?? {});
     this.client = c;
     return c;
@@ -154,7 +154,13 @@ export class WxBinding extends DurableObject<Env> {
 
   async send(req: Omit<SendRequest, "binding">): Promise<void> {
     const binding = await this.binding();
-    await sendMessage(await this.liveClient(), await this.allow(), { ...req, binding });
+    try {
+      await sendMessage(await this.liveClient(), await this.allow(), { ...req, binding });
+      await this.ctx.storage.put("last_send", { state: "sent", updated_at: Date.now() });
+    } catch (err) {
+      await this.ctx.storage.put("last_send", { state: "failed", updated_at: Date.now(), error: (err as Error).message.slice(0, 500) });
+      throw err;
+    }
   }
 
   async mcpSendOnce(id: string, fingerprint: string, req: Omit<SendRequest, "binding">) {
@@ -196,6 +202,7 @@ export class WxBinding extends DurableObject<Env> {
       webhook_host: cfg.webhook?.url ? new URL(cfg.webhook.url).host : "",
       inbox: counts,
       login: (await this.ctx.storage.get<LoginState>(K.login))?.status,
+      last_send: (await this.ctx.storage.get<{ state: string; updated_at: number; error?: string }>("last_send")) ?? null,
     };
   }
 

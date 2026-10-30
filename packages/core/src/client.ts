@@ -28,6 +28,10 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Backoff between CDN download retries (default 1s, then 3s). */
   downloadRetryDelaysMs?: number[];
+  /** Try one tokenless send only after an explicit stale-context rejection. */
+  recoverStaleContext?: boolean;
+  /** Minimum spacing between sendmessage requests, including recovery attempts. */
+  minSendIntervalMs?: number;
 }
 
 export interface MediaToSend {
@@ -44,6 +48,12 @@ const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 90_000;
 const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000];
 
+class IlinkApiError extends WxBotError {
+  constructor(readonly ret: number, readonly errcode: number, readonly detail: string, path: string) {
+    super("upstream", `${path}: ret=${ret} errcode=${errcode} errmsg=${detail || "(none)"}`);
+  }
+}
+
 /** Talks to the iLink bot API for one logged-in binding. */
 export class IlinkClient {
   readonly baseUrl: string;
@@ -54,6 +64,12 @@ export class IlinkClient {
   private readonly cdnBase: string;
   private readonly timeoutMs: number;
   private readonly downloadRetryDelaysMs: number[];
+  private readonly recoverStaleContext: boolean;
+  private readonly minSendIntervalMs: number;
+  private sendTail: Promise<void> = Promise.resolve();
+  private lastSendAt = 0;
+  /** A recovery preference only for the exact token that was rejected. */
+  private readonly tokenlessFor = new Map<string, string>();
   /** Latest context_token per wxid; required to reply. */
   readonly contextTokens = new Map<string, string>();
 
@@ -66,6 +82,8 @@ export class IlinkClient {
     this.cdnBase = (opts.cdnBase ?? DEFAULT_CDN_BASE).replace(/\/+$/, "");
     this.timeoutMs = opts.timeoutMs ?? 15_000;
     this.downloadRetryDelaysMs = opts.downloadRetryDelaysMs ?? DOWNLOAD_RETRY_DELAYS_MS;
+    this.recoverStaleContext = opts.recoverStaleContext ?? false;
+    this.minSendIntervalMs = Math.max(0, opts.minSendIntervalMs ?? 0);
   }
 
   loadTokens(tokens: Record<string, string>): void {
@@ -196,18 +214,46 @@ export class IlinkClient {
   }
 
   private async sendItem(wxid: string, item: MessageItem): Promise<void> {
-    await this.post("/ilink/bot/sendmessage", {
-      msg: {
+    const pending = this.sendTail.then(() => this.sendItemNow(wxid, item));
+    this.sendTail = pending.catch(() => {});
+    return pending;
+  }
+
+  private async sendItemNow(wxid: string, item: MessageItem): Promise<void> {
+    const token = this.contextTokens.get(wxid) ?? "";
+    const useTokenless = !!token && this.tokenlessFor.get(wxid) === token;
+    const msg = {
         from_user_id: this.botId,
         to_user_id: wxid,
         client_id: `wxbot-${toHex(randomBytes(8))}`,
         message_type: 2,
         message_state: 2,
-        context_token: this.contextTokens.get(wxid) ?? "",
         item_list: [item],
-      },
-      base_info: BASE_INFO,
-    });
+    };
+    const attempt = async (contextToken?: string) => {
+      const remaining = this.lastSendAt + this.minSendIntervalMs - Date.now();
+      if (remaining > 0) await sleep(remaining);
+      this.lastSendAt = Date.now();
+      await this.post("/ilink/bot/sendmessage", {
+        msg: { ...msg, ...(contextToken ? { context_token: contextToken } : {}) },
+        base_info: BASE_INFO,
+      });
+    };
+    try {
+      await attempt(useTokenless ? undefined : token);
+    } catch (err) {
+      const stale = err instanceof IlinkApiError && (err.ret === -2 || err.errcode === -2)
+        && ["unknown error", "prepare failed"].includes(err.detail.trim().toLowerCase());
+      // A timeout/HTTP failure is ambiguous: never repeat it. Authentication and
+      // recipient restrictions stay intact; only the rejected context is omitted.
+      if (!this.recoverStaleContext || !token || useTokenless || !stale) throw err;
+      try {
+        await attempt(); // Same client_id and item; at most one recovery attempt.
+      } catch (recoveryError) {
+        throw new WxBotError("upstream", `${(recoveryError as Error).message}; automatic context recovery did not succeed; do not retry automatically`, { cause: recoveryError });
+      }
+      this.tokenlessFor.set(wxid, token);
+    }
   }
 
   private async uploadMedia(wxid: string, data: Uint8Array, itemType: number) {
@@ -302,7 +348,14 @@ export class IlinkClient {
     if (ret === ERR_CODE_EXPIRED || errcode === ERR_CODE_EXPIRED) {
       throw new WxBotError("expired", `${path}: ilink session expired (errcode -14)`);
     }
-    if (path === "/ilink/bot/sendmessage" && ret !== 0) throw new WxBotError("upstream", `${path}: ret=${ret}`);
+    if (ret !== 0 || errcode !== 0) {
+      let detail = typeof parsed.errmsg === "string" ? parsed.errmsg : "";
+      for (const secret of [this.token, ...this.contextTokens.values()]) {
+        if (secret) detail = detail.replaceAll(secret, "[redacted]");
+      }
+      detail = detail.replace(/[\r\n\t]/g, " ").slice(0, 300);
+      throw new IlinkApiError(ret, errcode, detail, path);
+    }
     return parsed as T;
   }
 }

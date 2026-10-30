@@ -65,6 +65,15 @@ test("existing API routes are passed through and untrusted Origin is rejected", 
   expect((await f.rpc(await f.link(), "tools/list", {}, false, { Origin: "https://attacker.example" })).status).toBe(403);
 });
 
+test("status distinguishes login from the last actual send result", async () => {
+  const f = fixture();
+  const last = { state: "failed", updated_at: 123, error: "sendmessage: ret=-2 errcode=0 errmsg=prepare failed" };
+  Object.assign(f.state, { last_send: last });
+  const result = await f.call(await f.link(), "wechat_status", {});
+  expect(result.result.structuredContent.logged_in).toBe(true);
+  expect(result.result.structuredContent.last_send).toEqual(last);
+});
+
 test("legacy initialize, tool discovery, and notification acknowledgements", async () => {
   const f = fixture(); const url = await f.link();
   const init = await (await f.rpc(url, "initialize", { protocolVersion: "2025-06-18" })).json();
