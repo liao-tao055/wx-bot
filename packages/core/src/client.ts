@@ -49,9 +49,19 @@ const DOWNLOAD_MAX_ATTEMPTS = 3;
 const DOWNLOAD_RETRY_DELAYS_MS = [1_000, 3_000];
 
 class IlinkApiError extends WxBotError {
-  constructor(readonly ret: number, readonly errcode: number, readonly detail: string, path: string) {
+  constructor(readonly ret: number, readonly errcode: number, readonly detail: string, readonly path: string) {
     super("upstream", `${path}: ret=${ret} errcode=${errcode} errmsg=${detail || "(none)"}`);
   }
+}
+
+/** Only an explicit send rejection qualifies; timeouts and CDN errors do not. */
+export function isPrepareFailure(error: unknown): boolean {
+  if (error instanceof IlinkApiError) {
+    return error.path === "/ilink/bot/sendmessage"
+      && (error.ret === -2 || error.errcode === -2)
+      && ["unknown error", "prepare failed"].includes(error.detail.trim().toLowerCase());
+  }
+  return error instanceof WxBotError && error.cause !== error && isPrepareFailure(error.cause);
 }
 
 /** Talks to the iLink bot API for one logged-in binding. */
@@ -92,6 +102,11 @@ export class IlinkClient {
 
   tokens(): Record<string, string> {
     return Object.fromEntries(this.contextTokens);
+  }
+
+  /** Re-assert the authenticated client lifecycle; this sends no chat message. */
+  async notifyStart(): Promise<void> {
+    await this.post("/ilink/bot/msg/notifystart", { base_info: BASE_INFO });
   }
 
   /**
