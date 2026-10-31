@@ -8,9 +8,9 @@ const enc = new TextEncoder();
 const BINDING = /^[a-z0-9_-]{1,32}$/;
 const VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
-export const MCP_SERVER_VERSION = "0.2.0";
+export const MCP_SERVER_VERSION = "0.3.0";
 const SERVER = { name: "wx-bot-personal", version: MCP_SERVER_VERSION };
-const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text. Use stable delivery_id values (task + scheduled time + filename) to avoid duplicates for seven days. For local PDF/ZIP files use wechat_send_file with the local file in its file parameter. If the host cannot hydrate file inputs, use wechat_prepare_file_upload, then PUT exact local bytes to its short-lived upload_url with curl --fail-with-body --upload-file. Never expose connection or upload URLs in chat. Report errors here, not in WeChat. no_context requires a new user message to ClawBot; expired requires re-login. Never retry uncertain delivery automatically.";
+const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text. Use stable delivery_id values (task + scheduled time + filename) to avoid duplicates for seven days. Any file format is supported as a native file attachment, including PDF, ZIP, Word, Excel, PowerPoint, text, and images; each file is at most 10 MiB. wechat_send_file requires the host-converted file object, NOT a local path string. For local workspace files when host conversion is unavailable, use wechat_prepare_file_upload, then PUT exact local bytes to its short-lived upload_url. A successful PUT sends the file; do not send it again through another route. Never expose connection or upload URLs in chat. Report errors here, not in WeChat. no_context requires a new user message to ClawBot; expired requires re-login. Never retry uncertain delivery automatically.";
 const REVIEW_INSTRUCTIONS = " Only after the user explicitly checks WeChat, confirms non-receipt, and authorizes one retry, call wechat_confirm_not_received using the latest delivery status timestamp. A greeting, elapsed time, and the absence of a sent receipt are not consent. Then retry the same delivery_id and identical content exactly once. Never create a new ID to bypass uncertainty.";
 
 const textProp = (description: string, maxLength: number) => ({ type: "string", description, minLength: 1, maxLength });
@@ -24,13 +24,13 @@ const TOOLS = [
   { name: "wechat_status", description: "Check this personal WeChat binding's login before sending. No recipient can be selected.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: readAnnotations },
   { name: "wechat_send_text", description: "Send authorized plain-text task results to the verified WeChat owner. Do not send errors here.", inputSchema: { type: "object", properties: { ...common, text: textProp("Plain text to deliver.", 12000) }, required: ["delivery_id", "text"], additionalProperties: false }, annotations: writeAnnotations },
   {
-    name: "wechat_send_file", description: "Send a locally generated or user-provided PDF or ZIP as a native WeChat attachment, at most 10 MiB. Pass the local file using the host's file input handling. Does not accept arbitrary download sites.",
-    inputSchema: { type: "object", properties: { ...common, filename: textProp("Attachment basename ending in .pdf or .zip.", 180), file: { type: "object", properties: { download_url: { type: "string" }, file_id: { type: "string" }, file_name: { type: "string" }, mime_type: { type: "string" } }, required: ["download_url", "file_id"], additionalProperties: false } }, required: ["delivery_id", "filename", "file"], additionalProperties: false },
+    name: "wechat_send_file", description: "Send any user-authorized file as a native WeChat file attachment, including PDF, ZIP, Word, Excel, PowerPoint, text, or images, at most 10 MiB. file must be a host-converted file object, not a local path string. If conversion is unavailable use wechat_prepare_file_upload and PUT the local bytes. Does not accept arbitrary download sites.",
+    inputSchema: { type: "object", properties: { ...common, filename: textProp("Original attachment basename, including its extension if present; no directory separators.", 180), file: { type: "object", properties: { download_url: { type: "string" }, file_id: { type: "string" }, file_name: { type: "string" }, mime_type: { type: "string" } }, required: ["download_url", "file_id"], additionalProperties: false } }, required: ["delivery_id", "filename", "file"], additionalProperties: false },
     annotations: writeAnnotations, _meta: { "openai/fileParams": ["file"] },
   },
   {
-    name: "wechat_prepare_file_upload", description: "Fallback for a local PDF/ZIP when host file inputs are unavailable: obtain a 5-minute PUT URL, then upload exact file bytes from the execution environment. A successful PUT sends the native WeChat attachment. No phone action is needed.",
-    inputSchema: { type: "object", properties: { ...common, filename: textProp("Attachment basename ending in .pdf or .zip.", 180), size_bytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES }, sha256: { type: "string", pattern: "^[a-fA-F0-9]{64}$", description: "Compute from the exact local file bytes." } }, required: ["delivery_id", "filename", "size_bytes", "sha256"], additionalProperties: false }, annotations: { ...writeAnnotations, openWorldHint: false },
+    name: "wechat_prepare_file_upload", description: "Upload any authorized local workspace file (PDF, ZIP, Word, Excel, PowerPoint, text, images, or other binary files) when host file conversion is unavailable. Obtain a 5-minute PUT URL and upload exact bytes from the execution environment. A successful PUT sends the native WeChat file attachment. No phone transfer is needed.",
+    inputSchema: { type: "object", properties: { ...common, filename: textProp("Original attachment basename, including its extension if present; no directory separators.", 180), size_bytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES }, sha256: { type: "string", pattern: "^[a-fA-F0-9]{64}$", description: "Compute from the exact local file bytes." } }, required: ["delivery_id", "filename", "size_bytes", "sha256"], additionalProperties: false }, annotations: { ...writeAnnotations, openWorldHint: false },
   },
   { name: "wechat_delivery_status", description: "Check a stable delivery_id after a timeout. A pending/uncertain delivery must be reviewed in WeChat, not automatically resent.", inputSchema: { type: "object", properties: { delivery_id: common.delivery_id }, required: ["delivery_id"], additionalProperties: false }, annotations: readAnnotations },
   {
@@ -66,7 +66,7 @@ function taskTitle(x: unknown): string {
 }
 function filename(x: unknown): string {
   const name = str(x, "filename", 180);
-  if (!/\.(pdf|zip)$/i.test(name) || /[\\/\x00-\x1f\x7f]/.test(name)) throw new HttpError(400, "Use a PDF/ZIP basename without directory separators");
+  if (!name.trim() || name === "." || name === ".." || /[\\/\x00-\x1f\x7f]/.test(name)) throw new HttpError(400, "Use a non-empty attachment basename without directory separators or control characters");
   return name;
 }
 function caption(title: string): string | undefined { return title ? `【${title}】` : undefined; }
@@ -75,7 +75,11 @@ function b64(bytes: Uint8Array): string {
 }
 function unb64(value: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new HttpError(401, "Invalid upload ticket");
-  try { return Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)); }
+  try {
+    const decoded = Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+    if (b64(decoded) !== value) throw new HttpError(401, "Invalid upload ticket");
+    return decoded;
+  }
   catch { throw new HttpError(401, "Invalid upload ticket"); }
 }
 async function mac(secret: string, purpose: string): Promise<Uint8Array> {
@@ -142,9 +146,10 @@ async function owner(env: Env, binding: string): Promise<string> {
 function verifyFile(name: string, data: Uint8Array) {
   if (!data.length || data.length > MAX_FILE_BYTES) throw new HttpError(413, "File must have 1 byte to 10 MiB");
   const signature = new TextDecoder().decode(data.slice(0, 8));
-  if (/\.pdf$/i.test(name) ? !signature.startsWith("%PDF-") : !(data[0] === 80 && data[1] === 75 && ((data[2] === 3 && data[3] === 4) || (data[2] === 5 && data[3] === 6) || (data[2] === 7 && data[3] === 8)))) {
-    throw new HttpError(400, "File content does not match its PDF/ZIP extension");
-  }
+  const zip = data[0] === 80 && data[1] === 75 && ((data[2] === 3 && data[3] === 4) || (data[2] === 5 && data[3] === 6) || (data[2] === 7 && data[3] === 8));
+  if (/\.pdf$/i.test(name) && !signature.startsWith("%PDF-")) throw new HttpError(400, "File content does not match its PDF extension");
+  if (/\.(zip|docx|docm|xlsx|xlsm|pptx|pptm|odt|ods|odp)$/i.test(name) && !zip) throw new HttpError(400, "File content does not match its ZIP-based document extension");
+  // Other formats are opaque bytes, not converted, executed, or interpreted.
 }
 function trustedFileUrl(raw: string): URL {
   const u = new URL(raw);
@@ -179,7 +184,8 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
   if (name === "wechat_status") {
     const st = await stub(env, binding).status();
     return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES, last_send: st.last_send ?? null,
-      server_version: SERVER.version, context_available: st.context_available ?? false, context_observed_at: st.context_observed_at ?? null, poll_health: st.poll_health ?? null };
+      server_version: SERVER.version, supported_file_types: "any", file_delivery_mode: "native_file", upload_url_ttl_seconds: 300,
+      context_available: st.context_available ?? false, context_observed_at: st.context_observed_at ?? null, poll_health: st.poll_health ?? null };
   }
   const id = str(a.delivery_id, "delivery_id", 200);
   if (name === "wechat_delivery_status") {
@@ -199,6 +205,7 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
   }
   const fileName = filename(a.filename);
   if (name === "wechat_send_file") {
+    if (!a.file || typeof a.file !== "object" || Array.isArray(a.file)) throw new HttpError(400, "file must be a host-converted file object, not a local path. For a local workspace file use wechat_prepare_file_upload, then PUT its exact bytes.");
     const f = object(a.file);
     str(f.file_id, "file.file_id", 300);
     return sendFile(env, binding, to, id, title, fileName, await downloadFile(str(f.download_url, "file.download_url", 16000)));
@@ -207,9 +214,16 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
     const size = a.size_bytes;
     const digest = str(a.sha256, "sha256", 64).toLowerCase();
     if (typeof size !== "number" || !Number.isInteger(size) || size < 1 || size > MAX_FILE_BYTES || !/^[a-f0-9]{64}$/.test(digest)) throw new HttpError(400, "Provide exact size_bytes (1-10 MiB) and a 64-character SHA-256 hash");
+    const fingerprint = await sha256(JSON.stringify([to, title, fileName, digest]));
+    const previous = await stub(env, binding).mcpDeliveryStatus(id);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) throw new HttpError(400, "delivery_id was already used for different content");
+      if (previous.state === "sent") return { ok: true, duplicate: true, already_sent: true, delivery_id: id, state: "sent" };
+      if (previous.state !== "retry_ready") throw new WxBotError("upstream", "Delivery is pending or uncertain. Check WeChat and wechat_delivery_status; do not resend automatically.");
+    }
     const expires = Date.now() + 5 * 60_000;
     const token = await seal(env.API_TOKEN, { binding, to, id, title, filename: fileName, size, sha256: digest, expires_at: expires });
-    return { upload_url: `${origin}/mcp-upload/${token}`, method: "PUT", content_type: "application/octet-stream", expires_at: expires, instructions: "PUT the exact local file bytes to upload_url. Success sends the WeChat attachment. Do not share this URL in the user-facing response." };
+    return { upload_url: `${origin}/mcp-upload/${token}`, method: "PUT", content_type: "application/octet-stream", expires_at: expires, delivery_id: id, instructions: "PUT the exact local file bytes to upload_url. Success sends the WeChat attachment. An already_sent response needs no upload. Do not share this URL in the user-facing response." };
   }
   throw new HttpError(400, "Unknown tool");
 }
@@ -279,7 +293,8 @@ export async function handleMcpRequest(req: Request, env: Env): Promise<Response
         const result = await tool(env, binding, params.name, args, url.origin);
         return ok(id, { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result }, modern);
       } catch (err) {
-        return ok(id, { isError: true, content: [{ type: "text", text: errorMessage(err) }] }, modern);
+        const message = errorMessage(err);
+        return ok(id, { isError: true, content: [{ type: "text", text: message }], structuredContent: { ok: false, error: { kind: err instanceof WxBotError ? err.kind : err instanceof HttpError ? "invalid_request" : "unexpected", message } } }, modern);
       }
     }
     return fail(id, -32601, "Method not found", 404);

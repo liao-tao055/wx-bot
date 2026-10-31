@@ -85,6 +85,18 @@ test("non-owner recipient is forbidden; owner still needs a context token", asyn
   expect(f.sent.length).toBe(0);
 });
 
+test("file attachments keep their filename and file type even for image or video extensions", async () => {
+  const f = fake(); f.client.contextTokens.set("owner", "ctx");
+  const data = Uint8Array.from([0, 255, 10, 42]);
+  for (const fileName of ["原图.png", "剪辑.mp4", "统计.xlsx", "说明.docx"]) {
+    await sendMessage(f.client, allowlist("owner"), { binding: "b", to: "owner", media: { kind: "file", data, fileName } });
+    const item = f.sent.at(-1).msg.item_list[0];
+    expect(item.type).toBe(ItemType.File);
+    expect(item.file_item.file_name).toBe(fileName);
+    expect(f.upReqs.at(-1).media_type).toBe(3);
+  }
+});
+
 test("expired session surfaces as kind expired", async () => {
   const srv = serve(() => Response.json({ ret: -14 }));
   stops.push(srv.stop);

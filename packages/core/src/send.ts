@@ -1,6 +1,5 @@
 import type { IlinkClient } from "./client.ts";
 import { WxBotError } from "./errors.ts";
-import { itemTypeFromName } from "./text.ts";
 import { ItemType, MAX_MEDIA_BYTES } from "./types.ts";
 
 export type MediaKind = "image" | "file" | "video";
@@ -47,6 +46,6 @@ export async function sendMessage(client: IlinkClient, allow: Set<string>, req: 
   if (!req.media) throw new WxBotError("bad_request", "one of text, image, file, video is required");
   if (req.media.data.length > MAX_MEDIA_BYTES) throw new WxBotError("too_large", "file too large (>100 MB)");
   const itemType =
-    req.media.kind === "image" ? ItemType.Image : req.media.kind === "video" ? ItemType.Video : itemTypeFromName(req.media.fileName);
+    req.media.kind === "image" ? ItemType.Image : req.media.kind === "video" ? ItemType.Video : ItemType.File;
   await client.sendMedia(req.to, { data: req.media.data, fileName: req.media.fileName, itemType, caption: req.caption });
 }

@@ -158,9 +158,27 @@ test("tampered, expired, changed-owner and wrong-byte uploads never send", async
   expect(f.sent).toHaveLength(0);
 });
 
+test("noncanonical upload ticket encodings are rejected before sending", async () => {
+  const f = fixture(); const url = await f.link();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let checked = 0;
+  for (const filename of ["a.pdf", "ab.pdf", "abc.pdf"]) {
+    const upload = (await prepare(f, url, { filename })).structuredContent.upload_url as string;
+    const token = upload.slice(upload.lastIndexOf("/") + 1);
+    if (token.length % 4 === 0) continue;
+    const alternate = token.slice(0, -1) + alphabet[alphabet.indexOf(token.at(-1)!) ^ 1];
+    const decode = (s: string) => atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+    expect(decode(alternate)).toBe(decode(token));
+    expect((await f.request(upload.slice(0, -token.length) + alternate, { method: "PUT", body: pdf })).status).toBe(401);
+    checked++;
+  }
+  expect(checked).toBe(2);
+  expect(f.sent).toHaveLength(0);
+});
+
 test("file limits, extensions, path traversal and hashes are validated", async () => {
   const f = fixture(); const url = await f.link();
-  for (const extra of [{ filename: "../x.pdf" }, { filename: "x.exe" }, { size_bytes: MAX_FILE_BYTES + 1 }, { sha256: "x".repeat(64) }]) expect((await prepare(f, url, extra)).isError).toBe(true);
+  for (const extra of [{ filename: "../x.pdf" }, { filename: ".." }, { filename: " " }, { filename: "line\nfile.txt" }, { size_bytes: MAX_FILE_BYTES + 1 }, { sha256: "x".repeat(64) }]) expect((await prepare(f, url, extra)).isError).toBe(true);
   const result = await prepare(f, url, { filename: "not-a-zip.zip" });
   expect((await f.request(result.structuredContent.upload_url, { method: "PUT", body: pdf })).status).toBe(400);
   expect(f.sent).toHaveLength(0);
@@ -252,5 +270,60 @@ test("status reports context observation and poll health separately from login",
   const f = fixture(); const url = await f.link();
   Object.assign(f.state, { context_available: true, context_observed_at: 12345, poll_health: { ok: false, updated_at: 12350, error: "getupdates HTTP 502" } });
   const status = (await f.call(url, "wechat_status", {})).result.structuredContent;
-  expect(status).toMatchObject({ server_version: "0.2.0", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" } });
+  expect(status).toMatchObject({ server_version: "0.3.0", supported_file_types: "any", file_delivery_mode: "native_file", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" } });
+});
+
+test("workspace uploads preserve Office, text, images and arbitrary binary files exactly", async () => {
+  const f = fixture(); const url = await f.link();
+  const zip = Uint8Array.from([80, 75, 5, 6, ...new Array(18).fill(0)]);
+  const binary = Uint8Array.from([0, 255, 128, 13, 10, 42]);
+  for (const [name, data] of [
+    ["数学预测卷.pdf", pdf], ["资料.zip", zip], ["详细解答.docx", zip], ["成绩.xlsx", zip],
+    ["讲解.pptx", zip], ["旧版文档.doc", binary], ["旧版表格.xls", binary],
+    ["说明.txt", new TextEncoder().encode("原样中文\r\n")], ["data.csv", binary],
+    ["原始图片.png", binary], ["recording.mp4", binary], ["opaque.bin", binary], ["LICENSE", binary],
+  ] as [string, Uint8Array][]) {
+    const result = (await f.call(url, "wechat_prepare_file_upload", { delivery_id: "files:" + name, filename: name, size_bytes: data.length, sha256: await sha256(data) })).result;
+    expect(result.isError).not.toBe(true);
+    const upload = result.structuredContent.upload_url;
+    expect((await f.request(upload, { method: "PUT", body: data })).status).toBe(200);
+    expect(f.sent.at(-1).media).toEqual({ kind: "file", fileName: name, data });
+    expect((await (await f.request(upload, { method: "PUT", body: data })).json()).duplicate).toBe(true);
+  }
+  expect(f.sent).toHaveLength(13);
+});
+
+test("host file inputs support Word and Excel and malformed local paths explain the upload fallback", async () => {
+  const f = fixture(); const url = await f.link();
+  const zip = Uint8Array.from([80, 75, 5, 6, ...new Array(18).fill(0)]);
+  const network = spyOn(globalThis, "fetch").mockImplementation(async () => new Response(zip));
+  try {
+    for (const filename of ["作业.docx", "统计.xlsx"]) {
+      const result = (await f.call(url, "wechat_send_file", { delivery_id: filename, filename, file: { download_url: "https://files.oaiusercontent.com/file", file_id: "test" } })).result;
+      expect(result.structuredContent.ok).toBe(true);
+      expect(f.sent.at(-1).media).toEqual({ kind: "file", fileName: filename, data: zip });
+    }
+    const bad = (await f.call(url, "wechat_send_file", { delivery_id: "local", filename: "作业.docx", file: "/workspace/作业.docx" })).result;
+    expect(bad.isError).toBe(true);
+    expect(bad.structuredContent.error.message).toContain("wechat_prepare_file_upload");
+    expect(network).toHaveBeenCalledTimes(2);
+  } finally { network.mockRestore(); }
+});
+
+test("preparing again detects a sent file, content mismatch and unresolved delivery before uploading", async () => {
+  const f = fixture(); const url = await f.link();
+  const first = (await prepare(f, url)).structuredContent;
+  expect((await f.request(first.upload_url, { method: "PUT", body: pdf })).status).toBe(200);
+  const duplicate = (await prepare(f, url)).structuredContent;
+  expect(duplicate).toMatchObject({ already_sent: true, duplicate: true, state: "sent" });
+  expect(duplicate.upload_url).toBeUndefined();
+  const changed = await prepare(f, url, { sha256: await sha256(new TextEncoder().encode("changed")) });
+  expect(changed.isError).toBe(true);
+  expect(changed.structuredContent.error.message).toContain("different content");
+  const receipt = await readDelivery(f.storage, "pdf:run1");
+  await f.storage.put("mcp:delivery:" + await sha256("pdf:run1"), { ...receipt, state: "uncertain" });
+  const blocked = await prepare(f, url);
+  expect(blocked.isError).toBe(true);
+  expect(blocked.structuredContent.error.message).toContain("uncertain");
+  expect(f.sent).toHaveLength(1);
 });
