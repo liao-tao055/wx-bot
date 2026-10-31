@@ -280,6 +280,7 @@ export class WxBinding extends DurableObject<Env> {
     if (s && !expired && await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
     return {
       name: b ?? "",
+      server_version: MCP_SERVER_VERSION,
       logged_in: !!s,
       expired,
       context_available: !!(s && tokens[s.ilink_user_id]),
