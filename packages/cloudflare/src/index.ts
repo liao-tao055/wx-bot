@@ -282,9 +282,15 @@ export class WxBinding extends DurableObject<Env> {
       catch { expired = !!(await this.ctx.storage.get(K.expired)); }
     }
     const tokens = (await this.ctx.storage.get<Record<string, string>>(K.tokens)) ?? {};
-    // A missing alarm must not leave a valid account silently unable to receive
-    // the owner's new context. This only wakes polling; it never sends a message.
-    if (s && !expired && await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
+    const pollerRunning = !!this.pollAbort && !this.pollAbort.signal.aborted;
+    const health = (await this.ctx.storage.get<SessionHealth>("poll_health")) ?? null;
+    let alarmAt = await this.ctx.storage.getAlarm();
+    // A retained overdue alarm is not proof of a running poller after an
+    // eviction/deploy. Preserve an active poller or a short scheduled retry.
+    if (s && !expired && !pollerRunning && (alarmAt === null || alarmAt <= Date.now() || alarmAt > Date.now() + 30_000)) {
+      alarmAt = Date.now();
+      await this.ctx.storage.setAlarm(alarmAt);
+    }
     return {
       name: b ?? "",
       server_version: MCP_SERVER_VERSION,
@@ -292,7 +298,12 @@ export class WxBinding extends DurableObject<Env> {
       expired,
       context_available: !!(s && tokens[s.ilink_user_id]),
       context_observed_at: (await this.ctx.storage.get<number>("context_observed_at")) ?? null,
-      poll_health: (await this.ctx.storage.get<{ ok: boolean; updated_at: number; error?: string }>("poll_health")) ?? null,
+      poll_health: health,
+      poll_health_age_ms: health ? Math.max(0, Date.now() - health.updated_at) : null,
+      poller_running: pollerRunning,
+      poll_alarm_at: alarmAt,
+      poll_alarm_health: (await this.ctx.storage.get("poll_alarm_health")) ?? null,
+      last_inbound_at: (await this.ctx.storage.get<number>("last_inbound_at")) ?? null,
       session_start: (await this.ctx.storage.get<SessionHealth>("session_start")) ?? null,
       session_recovery: (await this.ctx.storage.get<SessionHealth>("session_recovery")) ?? null,
       bot_id: s ? `${s.ilink_bot_id.slice(0, 4)}…` : "",
@@ -418,6 +429,24 @@ export class WxBinding extends DurableObject<Env> {
   // ---------- alarm: login, polling, delivery ----------
 
   override async alarm(): Promise<void> {
+    const startedAt = Date.now();
+    await this.ctx.storage.put("poll_alarm_health", { state: "running", started_at: startedAt, updated_at: startedAt });
+    try {
+      await this.runAlarm();
+      await this.ctx.storage.put("poll_alarm_health", { state: "completed", started_at: startedAt, updated_at: Date.now() });
+    } catch (err) {
+      this.pollAbort?.abort();
+      await this.ctx.storage.put("poll_alarm_health", { state: "failed", started_at: startedAt, updated_at: Date.now(), error: (err as Error).message.slice(0, 500) });
+      // Keep alarm failures visible and recover without relying on a finite
+      // platform retry budget. This never replays an outgoing delivery.
+      const login = await this.ctx.storage.get<LoginState>(K.login);
+      if (((await this.session()) && !(await this.ctx.storage.get(K.expired))) || login?.status === "waiting") {
+        await this.ctx.storage.setAlarm(Date.now() + 30_000);
+      }
+    }
+  }
+
+  private async runAlarm(): Promise<void> {
     const deadline = Date.now() + ALARM_SLICE_MS;
     const name = await this.ctx.storage.get<string>(K.binding);
     if (!name) return;
@@ -449,6 +478,7 @@ export class WxBinding extends DurableObject<Env> {
         onHealth: (health) => this.ctx.waitUntil(storage.put("poll_health", {
           ...health, updated_at: Date.now(),
         }).catch(() => {})),
+        onQueued: async () => { await storage.put("last_inbound_at", Date.now()); },
         log: (level, msg) => console[level === "info" ? "log" : level](`[${name}] ${msg}`),
         store: {
           loadCursor: async () => (await storage.get<string>(K.cursor)) ?? "",
@@ -465,8 +495,14 @@ export class WxBinding extends DurableObject<Env> {
     const cfg = await this.config();
     if (cfg.delivery === "webhook" && cfg.webhook?.url) tasks.push(this.deliverLoop(name, cfg.webhook, ctl.signal));
 
-    await Promise.allSettled(tasks);
-    clearTimeout(stopAt);
+    try {
+      const results = await Promise.allSettled(tasks);
+      const failure = results.find((r) => r.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+    } finally {
+      clearTimeout(stopAt);
+      if (this.pollAbort === ctl) this.pollAbort = undefined;
+    }
     // Keep going while there is work: a live session, pending login, or undelivered webhooks.
     const login = await this.ctx.storage.get<LoginState>(K.login);
     const pending = cfg.delivery === "webhook" && this.inbox.stats(name).pending > 0;

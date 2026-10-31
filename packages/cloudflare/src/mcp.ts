@@ -8,7 +8,7 @@ const enc = new TextEncoder();
 const BINDING = /^[a-z0-9_-]{1,32}$/;
 const VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
-export const MCP_SERVER_VERSION = "0.3.3";
+export const MCP_SERVER_VERSION = "0.3.4";
 const SERVER = { name: "wx-bot-personal", version: MCP_SERVER_VERSION };
 const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text. Use stable delivery_id values (task + scheduled time + filename) to avoid duplicates for seven days. Any file format is supported as a native file attachment, including PDF, ZIP, Word, Excel, PowerPoint, text, and images; each file is at most 10 MiB. wechat_send_file requires the host-converted file object, NOT a local path string. For local workspace files when host conversion is unavailable, use wechat_prepare_file_upload, then PUT exact local bytes to its short-lived upload_url. A successful PUT sends the file; do not send it again through another route. Never expose connection or upload URLs in chat. Report errors here, not in WeChat. no_context requires a new user message to ClawBot; expired requires re-login. Never retry uncertain delivery automatically.";
 const REVIEW_INSTRUCTIONS = " Only after the user explicitly checks WeChat, confirms non-receipt, and authorizes one retry, call wechat_confirm_not_received using the latest delivery status timestamp. A greeting, elapsed time, and the absence of a sent receipt are not consent. Then retry the same delivery_id and identical content exactly once. Never create a new ID to bypass uncertainty.";
@@ -186,6 +186,8 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
     return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES, last_send: st.last_send ?? null,
       server_version: SERVER.version, binding_server_version: st.server_version ?? null, supported_file_types: "any", file_delivery_mode: "native_file", upload_url_ttl_seconds: 300,
       context_available: st.context_available ?? false, context_observed_at: st.context_observed_at ?? null, poll_health: st.poll_health ?? null,
+      poll_health_age_ms: st.poll_health_age_ms ?? null, poller_running: st.poller_running ?? false, poll_alarm_at: st.poll_alarm_at ?? null,
+      poll_alarm_health: st.poll_alarm_health ?? null, last_inbound_at: st.last_inbound_at ?? null,
       session_start: st.session_start ?? null, session_recovery: st.session_recovery ?? null };
   }
   const id = str(a.delivery_id, "delivery_id", 200);

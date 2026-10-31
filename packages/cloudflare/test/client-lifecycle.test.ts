@@ -158,7 +158,7 @@ test("a cold health check reports actual lifecycle startup without sending chat 
   const f = fixture(); const paths: string[] = [];
   await withFetch(async (url) => { paths.push(new URL(String(url)).pathname); return Response.json({ ret: 0 }); }, async () => {
     const status = await f.binding.status();
-    assert.equal(status.server_version, "0.3.3");
+    assert.equal(status.server_version, "0.3.4");
     assert.equal(status.session_start.ok, true);
     assert.equal(status.expired, false);
     await f.binding.status();
@@ -175,4 +175,46 @@ test("health checks report lifecycle authentication expiry without another login
     assert.equal(status.session_start.ok, false);
     await f.binding.status(); assert.equal(calls, 1);
   });
+});
+
+test("health checks re-arm overdue polling and expose the age of historical health", async () => {
+  const f = fixture();
+  const old = Date.now() - 600_000;
+  await f.binding.ctx.storage.setAlarm(old);
+  f.data.set("poll_health", { ok: true, updated_at: old });
+  await withFetch(async () => Response.json({ ret: 0 }), async () => {
+    const before = Date.now();
+    const status = await f.binding.status();
+    assert.equal(status.poller_running, false);
+    assert.ok(status.poll_health_age_ms >= 600_000);
+    assert.ok(status.poll_alarm_at >= before);
+    assert.equal(status.poll_alarm_at, f.alarm());
+    assert.equal(f.data.get("last_send"), undefined);
+  });
+});
+
+test("health checks preserve a running poller and a short pending retry", async () => {
+  const f = fixture(); const controller = new AbortController();
+  f.binding.pollAbort = controller;
+  const old = Date.now() - 60_000;
+  await f.binding.ctx.storage.setAlarm(old);
+  await withFetch(async () => Response.json({ ret: 0 }), async () => {
+    assert.equal((await f.binding.status()).poller_running, true);
+    assert.equal(f.alarm(), old);
+    controller.abort();
+    const pending = Date.now() + 10_000;
+    await f.binding.ctx.storage.setAlarm(pending);
+    assert.equal((await f.binding.status()).poller_running, false);
+    assert.equal(f.alarm(), pending);
+  });
+});
+
+test("an unexpected alarm failure is observable and schedules a bounded poll restart", async () => {
+  const f = fixture(); const before = Date.now();
+  f.binding.runAlarm = async () => { throw new Error("poll-loop-test-error"); };
+  await f.binding.alarm();
+  assert.equal(f.data.get("poll_alarm_health").state, "failed");
+  assert.equal(f.data.get("poll_alarm_health").error, "poll-loop-test-error");
+  assert.ok(f.alarm()! >= before + 30_000);
+  assert.equal(f.data.get("last_send"), undefined);
 });

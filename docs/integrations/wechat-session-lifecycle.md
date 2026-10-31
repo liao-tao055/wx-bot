@@ -1,6 +1,6 @@
 # 微信会话生命周期修复
 
-MCP 0.3.3 在 Cloudflare 客户端初始化时调用官方 SDK 已使用的
+MCP 0.3.4 在 Cloudflare 客户端初始化时调用官方 SDK 已使用的
 `POST /ilink/bot/msg/notifystart`，仅上报 `base_info`，沿用原机器人认证。
 这不是聊天消息，也不会发保活文字。
 
@@ -30,4 +30,8 @@ https://github.com/Tencent/openclaw-weixin/pull/335
 让持续长轮询的绑定对象立即采用修复。`wechat_status.binding_server_version`
 用于区分入口 Worker 版本与绑定对象实际运行版本，避免把入口升级当成恢复已生效。
 冷启动的状态检查也会初始化客户端，并报告真实启动结果；不会发送聊天消息。
+状态检查不再把历史 `poll_health.ok` 当成当前轮询健康：同时显示健康年龄、
+正在运行的轮询、闹钟时间和最近闹钟结果。停滞且已到期的闹钟重新唤醒；
+正在运行的轮询和短期重试时间保持不变。闹钟异常显式记录并安排 30 秒后恢复，
+收到入站消息时仅记录接收时间，不在状态接口暴露消息正文。
 https://developers.cloudflare.com/changelog/post/2026-10-30-durable-objects-deferred-code-updates/

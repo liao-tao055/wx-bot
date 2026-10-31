@@ -270,7 +270,7 @@ test("status reports context observation and poll health separately from login",
   const f = fixture(); const url = await f.link();
   Object.assign(f.state, { context_available: true, context_observed_at: 12345, poll_health: { ok: false, updated_at: 12350, error: "getupdates HTTP 502" } });
   const status = (await f.call(url, "wechat_status", {})).result.structuredContent;
-  expect(status).toMatchObject({ server_version: "0.3.3", binding_server_version: null, supported_file_types: "any", file_delivery_mode: "native_file", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" }, session_start: null, session_recovery: null });
+  expect(status).toMatchObject({ server_version: "0.3.4", binding_server_version: null, supported_file_types: "any", file_delivery_mode: "native_file", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" }, session_start: null, session_recovery: null });
 });
 
 test("workspace uploads preserve Office, text, images and arbitrary binary files exactly", async () => {
