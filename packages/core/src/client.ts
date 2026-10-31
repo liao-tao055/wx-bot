@@ -223,7 +223,9 @@ export class IlinkClient {
     const token = this.contextTokens.get(wxid) ?? "";
     const useTokenless = !!token && this.tokenlessFor.get(wxid) === token;
     const msg = {
-        from_user_id: this.botId,
+        // Match @tencent-weixin/openclaw-weixin: authentication identifies the
+        // bot; the outbound from_user_id field is intentionally empty.
+        from_user_id: "",
         to_user_id: wxid,
         client_id: `wxbot-${toHex(randomBytes(8))}`,
         message_type: 2,

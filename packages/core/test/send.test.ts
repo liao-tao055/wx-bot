@@ -43,7 +43,7 @@ test("text is split and carries the context token", async () => {
   await sendMessage(f.client, allowlist("owner"), { binding: "b", to: "owner", text: "x".repeat(4001) });
   expect(f.sent.map((s) => s.msg.item_list[0].text_item.text.length)).toEqual([2000, 2000, 1]);
   const m = f.sent[0].msg;
-  expect([m.from_user_id, m.to_user_id, m.context_token, m.message_type, m.message_state]).toEqual(["bot@im.bot", "owner", "ctx", 2, 2]);
+  expect([m.from_user_id, m.to_user_id, m.context_token, m.message_type, m.message_state]).toEqual(["", "owner", "ctx", 2, 2]);
   expect(m.client_id).toMatch(/^wxbot-[0-9a-f]{16}$/);
 });
 
@@ -68,6 +68,7 @@ test("file upload: encrypted body, md5, caption first, original name kept", asyn
   expect(Buffer.concat([d.update(f.uploads[0]!.body), d.final()]).toString()).toBe("hello pdf bytes");
 
   expect(f.sent[0].msg.item_list[0].text_item.text).toBe("见附件");
+  expect(f.sent.every(s => s.msg.from_user_id === "" && s.msg.to_user_id === "owner")).toBe(true);
   const item = f.sent[1].msg.item_list[0];
   expect(item.type).toBe(ItemType.File);
   expect(item.file_item.file_name).toBe("报告.pdf");

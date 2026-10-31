@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { WxBotError } from "@wx-bot/core";
 import { handleMcpRequest, MAX_FILE_BYTES } from "../src/mcp.ts";
-import { deliverOnce, readDelivery, sha256 } from "../src/mcp-delivery.ts";
+import { confirmNotReceived, deliverOnce, readDelivery, sha256 } from "../src/mcp-delivery.ts";
 import type { Env } from "../src/index.ts";
 
 function memoryStorage() {
@@ -28,6 +28,7 @@ function fixture() {
   const fake = {
     status: async () => structuredClone(state),
     mcpDeliveryStatus: (id: string) => readDelivery(storage, id),
+    mcpConfirmNotReceived: (id: string, at: number, confirmed: boolean, authorized: boolean) => confirmNotReceived(storage, id, at, confirmed, authorized),
     mcpSendOnce: (id: string, fingerprint: string, req: unknown) => deliverOnce(storage, id, fingerprint, async () => { sent.push(req); }),
   };
   const env = { API_TOKEN: "a-private-runtime-secret-never-in-url", WXBOT: { idFromName: (s: string) => s, get: () => fake } } as unknown as Env;
@@ -79,7 +80,7 @@ test("legacy initialize, tool discovery, and notification acknowledgements", asy
   const init = await (await f.rpc(url, "initialize", { protocolVersion: "2025-06-18" })).json();
   expect(init.result.protocolVersion).toBe("2025-06-18");
   const tools = await (await f.rpc(url, "tools/list")).json();
-  expect(tools.result.tools).toHaveLength(5);
+  expect(tools.result.tools).toHaveLength(6);
   expect(tools.result.tools.find((t: any) => t.name === "wechat_send_file")._meta["openai/fileParams"]).toEqual(["file"]);
   expect((await f.request(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) })).status).toBe(202);
 });
@@ -208,4 +209,48 @@ test("a known no_context failure can be retried after the user sends a new messa
   await expect(deliverOnce(storage, "needs-context", "hash", async () => { throw new WxBotError("no_context", "message bot first"); })).rejects.toThrow("message bot first");
   expect(await readDelivery(storage, "needs-context")).toBeUndefined();
   expect(await deliverOnce(storage, "needs-context", "hash", async () => {})).toEqual({ ok: true, duplicate: false });
+});
+
+test("MCP explicit review arms an old receipt without sending a message", async () => {
+  const f = fixture(); const url = await f.link();
+  const at = Date.now() - 60_000;
+  await f.storage.put("mcp:delivery:" + await sha256("reviewed"), { fingerprint: "original", state: "uncertain", updated_at: at });
+  const args = { delivery_id: "reviewed", expected_updated_at: at, user_confirmed_not_received: true, user_authorized_retry: true };
+  const r = (await f.call(url, "wechat_confirm_not_received", args)).result;
+  expect(r.structuredContent).toMatchObject({ retry_ready: true, sent: false, state: "retry_ready" });
+  expect(f.sent).toHaveLength(0);
+  const receipt = (await f.call(url, "wechat_delivery_status", { delivery_id: "reviewed" })).result.structuredContent;
+  expect(receipt.state).toBe("retry_ready");
+});
+
+test("MCP review cannot infer confirmation or change the verified owner", async () => {
+  const f = fixture(); const url = await f.link(); const at = Date.now() - 60_000;
+  await f.storage.put("mcp:delivery:" + await sha256("reviewed"), { fingerprint: "original", state: "uncertain", updated_at: at });
+  const args = { delivery_id: "reviewed", expected_updated_at: at, user_confirmed_not_received: true, user_authorized_retry: true };
+  for (const change of [{ user_authorized_retry: false }, { user_confirmed_not_received: false }, { expected_updated_at: at - 1 }, { to: "other-owner" }]) {
+    expect((await f.call(url, "wechat_confirm_not_received", { ...args, ...change })).result.isError).toBe(true);
+  }
+  f.state.expired = true;
+  expect((await f.call(url, "wechat_confirm_not_received", args)).result.isError).toBe(true);
+  expect((await readDelivery(f.storage, "reviewed"))!.state).toBe("uncertain");
+  expect(f.sent).toHaveLength(0);
+});
+
+test("native PDF retry after human review preserves exact filename, title, owner and bytes", async () => {
+  const f = fixture(); const url = await f.link(); const at = Date.now() - 60_000;
+  const digest = await sha256(pdf);
+  const fp = await sha256(JSON.stringify(["verified-owner", "试卷", "预测卷.pdf", digest]));
+  await f.storage.put("mcp:delivery:" + await sha256("pdf:run1"), { fingerprint: fp, state: "uncertain", updated_at: at });
+  expect((await f.call(url, "wechat_confirm_not_received", { delivery_id: "pdf:run1", expected_updated_at: at, user_confirmed_not_received: true, user_authorized_retry: true })).result.structuredContent.sent).toBe(false);
+  const ticket = (await prepare(f, url)).structuredContent.upload_url;
+  expect((await f.request(ticket, { method: "PUT", body: pdf })).status).toBe(200);
+  expect((await (await f.request(ticket, { method: "PUT", body: pdf })).json()).duplicate).toBe(true);
+  expect(f.sent).toEqual([{ to: "verified-owner", caption: "【试卷】", media: { kind: "file", fileName: "预测卷.pdf", data: pdf } }]);
+});
+
+test("status reports context observation and poll health separately from login", async () => {
+  const f = fixture(); const url = await f.link();
+  Object.assign(f.state, { context_available: true, context_observed_at: 12345, poll_health: { ok: false, updated_at: 12350, error: "getupdates HTTP 502" } });
+  const status = (await f.call(url, "wechat_status", {})).result.structuredContent;
+  expect(status).toMatchObject({ server_version: "0.2.0", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" } });
 });

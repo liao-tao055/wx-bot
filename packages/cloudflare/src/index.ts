@@ -18,8 +18,8 @@
 //   env.WXBOT.get(env.WXBOT.idFromName("muse")).send({...}) / .pull() / .ack([...])
 
 import { DurableObject } from "cloudflare:workers";
-import { handleMcpRequest } from "./mcp.ts";
-import { deliverOnce, readDelivery } from "./mcp-delivery.ts";
+import { handleMcpRequest, MCP_SERVER_VERSION } from "./mcp.ts";
+import { confirmNotReceived, deliverOnce, readDelivery } from "./mcp-delivery.ts";
 import {
   allowlist,
   createApiHandler,
@@ -171,6 +171,11 @@ export class WxBinding extends DurableObject<Env> {
     return readDelivery(this.ctx.storage, id);
   }
 
+  async mcpConfirmNotReceived(id: string, updatedAt: number, confirmed: boolean, authorized: boolean) {
+    if ((await this.allow()).size !== 1) throw new WxBotError("forbidden", "Expected exactly one verified owner");
+    return confirmNotReceived(this.ctx.storage, id, updatedAt, confirmed, authorized);
+  }
+
   async pull(opts: { limit?: number; leaseMs?: number } = {}): Promise<unknown[]> {
     const b = await this.binding();
     if ((await this.config()).delivery !== "pull") throw new WxBotError("not_found", `binding "${b}" does not use pull delivery`);
@@ -191,10 +196,18 @@ export class WxBinding extends DurableObject<Env> {
     const s = await this.session();
     const cfg = await this.config();
     const counts: InboxCounts | undefined = b ? this.inbox.stats(b) : undefined;
+    const expired = !!(await this.ctx.storage.get(K.expired));
+    const tokens = (await this.ctx.storage.get<Record<string, string>>(K.tokens)) ?? {};
+    // A missing alarm must not leave a valid account silently unable to receive
+    // the owner's new context. This only wakes polling; it never sends a message.
+    if (s && !expired && await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
     return {
       name: b ?? "",
       logged_in: !!s,
-      expired: !!(await this.ctx.storage.get(K.expired)),
+      expired,
+      context_available: !!(s && tokens[s.ilink_user_id]),
+      context_observed_at: (await this.ctx.storage.get<number>("context_observed_at")) ?? null,
+      poll_health: (await this.ctx.storage.get<{ ok: boolean; updated_at: number; error?: string }>("poll_health")) ?? null,
       bot_id: s ? `${s.ilink_bot_id.slice(0, 4)}…` : "",
       cursor_set: !!(await this.ctx.storage.get(K.cursor)),
       allowlist: [...(await this.allow())].sort(),
@@ -218,6 +231,12 @@ export class WxBinding extends DurableObject<Env> {
     try {
       if (path === "/login" && req.method === "POST") return json(200, await this.startLogin());
       if (path === "/login" && req.method === "GET") return json(200, (await this.ctx.storage.get(K.login)) ?? { status: "idle" });
+      if (path === "/mcp-deliveries/confirm-not-received" && req.method === "POST") {
+        const body = await req.json() as Record<string, unknown>;
+        if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.delivery_id !== "string") throw new WxBotError("bad_request", "A delivery_id and explicit human confirmations are required");
+        const receipt = await this.mcpConfirmNotReceived(body.delivery_id, body.expected_updated_at as number, body.user_confirmed_not_received === true, body.user_authorized_retry === true);
+        return json(200, { delivery_id: body.delivery_id, state: receipt.state, updated_at: receipt.updated_at, retry_ready: true, sent: false });
+      }
       if (path === "/session" && req.method === "PUT") {
         const b = (await req.json()) as { session?: Session; context_tokens?: Record<string, string>; cursor?: string };
         if (!b.session?.bot_token || !b.session.base_url) throw new WxBotError("bad_request", "session.bot_token and session.base_url are required");
@@ -340,11 +359,14 @@ export class WxBinding extends DurableObject<Env> {
         inbox: this.inbox,
         allow: await this.allow(),
         media: this.mediaSink(),
+        onHealth: (health) => this.ctx.waitUntil(storage.put("poll_health", {
+          ...health, updated_at: Date.now(),
+        }).catch(() => {})),
         log: (level, msg) => console[level === "info" ? "log" : level](`[${name}] ${msg}`),
         store: {
           loadCursor: async () => (await storage.get<string>(K.cursor)) ?? "",
           saveCursor: (c) => storage.put(K.cursor, c),
-          saveTokens: (t) => storage.put(K.tokens, t),
+          saveTokens: (t) => storage.put({ [K.tokens]: t, context_observed_at: Date.now() }),
           markExpired: async () => {
             await storage.put(K.expired, new Date().toISOString());
             this.client = undefined;
@@ -396,7 +418,7 @@ export class WxBinding extends DurableObject<Env> {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    if (url.pathname === "/healthz") return new Response("ok\n");
+    if (url.pathname === "/healthz") return new Response("ok\n", { headers: { "X-WxBot-MCP-Version": MCP_SERVER_VERSION } });
     const mcp = await handleMcpRequest(req, env);
     if (mcp) return mcp;
     if (!env.API_TOKEN) return json(500, { error: "API_TOKEN is not configured" });

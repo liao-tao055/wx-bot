@@ -8,8 +8,10 @@ const enc = new TextEncoder();
 const BINDING = /^[a-z0-9_-]{1,32}$/;
 const VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
-const SERVER = { name: "wx-bot-personal", version: "0.1.0" };
+export const MCP_SERVER_VERSION = "0.2.0";
+const SERVER = { name: "wx-bot-personal", version: MCP_SERVER_VERSION };
 const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text. Use stable delivery_id values (task + scheduled time + filename) to avoid duplicates for seven days. For local PDF/ZIP files use wechat_send_file with the local file in its file parameter. If the host cannot hydrate file inputs, use wechat_prepare_file_upload, then PUT exact local bytes to its short-lived upload_url with curl --fail-with-body --upload-file. Never expose connection or upload URLs in chat. Report errors here, not in WeChat. no_context requires a new user message to ClawBot; expired requires re-login. Never retry uncertain delivery automatically.";
+const REVIEW_INSTRUCTIONS = " Only after the user explicitly checks WeChat, confirms non-receipt, and authorizes one retry, call wechat_confirm_not_received using the latest delivery status timestamp. A greeting, elapsed time, and the absence of a sent receipt are not consent. Then retry the same delivery_id and identical content exactly once. Never create a new ID to bypass uncertainty.";
 
 const textProp = (description: string, maxLength: number) => ({ type: "string", description, minLength: 1, maxLength });
 const common = {
@@ -31,6 +33,17 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { ...common, filename: textProp("Attachment basename ending in .pdf or .zip.", 180), size_bytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES }, sha256: { type: "string", pattern: "^[a-fA-F0-9]{64}$", description: "Compute from the exact local file bytes." } }, required: ["delivery_id", "filename", "size_bytes", "sha256"], additionalProperties: false }, annotations: { ...writeAnnotations, openWorldHint: false },
   },
   { name: "wechat_delivery_status", description: "Check a stable delivery_id after a timeout. A pending/uncertain delivery must be reviewed in WeChat, not automatically resent.", inputSchema: { type: "object", properties: { delivery_id: common.delivery_id }, required: ["delivery_id"], additionalProperties: false }, annotations: readAnnotations },
+  {
+    name: "wechat_confirm_not_received",
+    description: "After the owner explicitly checks WeChat, confirms this item was not received, and authorizes ONE same-ID same-content retry, arm that retry. Does not send anything. Never use automatically; sent or in-progress items cannot be unlocked.",
+    inputSchema: { type: "object", properties: {
+      delivery_id: common.delivery_id,
+      expected_updated_at: { type: "integer", minimum: 1, description: "Exact updated_at from the latest wechat_delivery_status result." },
+      user_confirmed_not_received: { type: "boolean", const: true, description: "True only after the user actually checks WeChat and explicitly confirms non-receipt of this item." },
+      user_authorized_retry: { type: "boolean", const: true, description: "True only after the user explicitly authorizes one retry, acknowledging possible duplicates if the old request completes late." },
+    }, required: ["delivery_id", "expected_updated_at", "user_confirmed_not_received", "user_authorized_retry"], additionalProperties: false },
+    annotations: { ...writeAnnotations, openWorldHint: false },
+  },
 ];
 
 type Obj = Record<string, unknown>;
@@ -165,7 +178,8 @@ async function sendFile(env: Env, binding: string, to: string, id: string, title
 async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: string): Promise<Obj> {
   if (name === "wechat_status") {
     const st = await stub(env, binding).status();
-    return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES, last_send: st.last_send ?? null };
+    return { binding, logged_in: st.logged_in, expired: st.expired, login: st.login ?? null, max_file_bytes: MAX_FILE_BYTES, last_send: st.last_send ?? null,
+      server_version: SERVER.version, context_available: st.context_available ?? false, context_observed_at: st.context_observed_at ?? null, poll_health: st.poll_health ?? null };
   }
   const id = str(a.delivery_id, "delivery_id", 200);
   if (name === "wechat_delivery_status") {
@@ -173,6 +187,10 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
     return { delivery_id: id, state: r?.state ?? "not_found", updated_at: r?.updated_at ?? null };
   }
   const to = await owner(env, binding);
+  if (name === "wechat_confirm_not_received") {
+    const r = await stub(env, binding).mcpConfirmNotReceived(id, a.expected_updated_at as number, a.user_confirmed_not_received === true, a.user_authorized_retry === true);
+    return { delivery_id: id, state: r.state, updated_at: r.updated_at, retry_ready: true, sent: false, instructions: "Retry the original delivery_id and identical content once. No message has been sent by this confirmation." };
+  }
   const title = taskTitle(a.task_title);
   if (name === "wechat_send_text") {
     const text = str(a.text, "text", 12000);
@@ -248,8 +266,8 @@ export async function handleMcpRequest(req: Request, env: Env): Promise<Response
       if (modern || !["notifications/initialized", "notifications/cancelled"].includes(msg.method)) return fail(null, -32600, "Unsupported notification");
       return new Response(null, { status: 202, headers: { "Cache-Control": "no-store" } });
     }
-    if (msg.method === "initialize" && !modern) return ok(id, { protocolVersion: typeof params.protocolVersion === "string" && VERSIONS.slice(1).includes(params.protocolVersion) ? params.protocolVersion : "2025-11-25", capabilities: { tools: {} }, serverInfo: SERVER, instructions: INSTRUCTIONS }, false);
-    if (msg.method === "server/discover") return ok(id, { supportedVersions: VERSIONS, capabilities: { tools: {} }, _meta: { "io.modelcontextprotocol/serverInfo": SERVER }, instructions: INSTRUCTIONS }, modern);
+    if (msg.method === "initialize" && !modern) return ok(id, { protocolVersion: typeof params.protocolVersion === "string" && VERSIONS.slice(1).includes(params.protocolVersion) ? params.protocolVersion : "2025-11-25", capabilities: { tools: {} }, serverInfo: SERVER, instructions: INSTRUCTIONS + REVIEW_INSTRUCTIONS }, false);
+    if (msg.method === "server/discover") return ok(id, { supportedVersions: VERSIONS, capabilities: { tools: {} }, _meta: { "io.modelcontextprotocol/serverInfo": SERVER }, instructions: INSTRUCTIONS + REVIEW_INSTRUCTIONS }, modern);
     if (msg.method === "ping") return ok(id, {}, modern);
     if (msg.method === "tools/list") return ok(id, { tools: TOOLS }, modern);
     if (msg.method === "tools/call") {
