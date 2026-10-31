@@ -25,6 +25,7 @@ import {
   createApiHandler,
   deliverNext,
   IlinkClient,
+  isPrepareFailure,
   Inbox,
   json,
   LoginApi,
@@ -71,6 +72,13 @@ interface LoginState {
 const ALARM_SLICE_MS = 14 * 60_000;
 const RETENTION_MS = 7 * 86_400_000;
 const BINDING_RE = /^[a-z0-9_-]{1,32}$/;
+const SESSION_RECOVERY_COOLDOWN_MS = 60_000;
+
+interface SessionHealth {
+  ok: boolean;
+  updated_at: number;
+  error?: string;
+}
 
 const K = {
   binding: "binding",
@@ -99,6 +107,9 @@ function doSql(storage: DurableObjectStorage): Sql {
 export class WxBinding extends DurableObject<Env> {
   private readonly inbox: Inbox;
   private client?: IlinkClient;
+  private clientInit?: Promise<IlinkClient>;
+  private clientGeneration = 0;
+  private sessionRecovery?: Promise<void>;
   private pollAbort?: AbortController;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -128,13 +139,75 @@ export class WxBinding extends DurableObject<Env> {
 
   private async liveClient(): Promise<IlinkClient> {
     if (this.client) return this.client;
+    if (this.clientInit) return this.clientInit;
+    const generation = this.clientGeneration;
+    const init = this.initialiseClient(generation);
+    this.clientInit = init;
+    try {
+      return await init;
+    } finally {
+      if (this.clientInit === init) this.clientInit = undefined;
+    }
+  }
+
+  private resetClient() {
+    this.clientGeneration++;
+    this.client = undefined;
+    this.clientInit = undefined;
+  }
+
+  private async initialiseClient(generation: number): Promise<IlinkClient> {
     const s = await this.session();
     if (!s) throw new WxBotError("expired", "not logged in: POST /login first");
     if (await this.ctx.storage.get(K.expired)) throw new WxBotError("expired", "session expired: POST /login to scan again");
     const c = new IlinkClient(s, { recoverStaleContext: true, minSendIntervalMs: 1_000 });
     c.loadTokens((await this.ctx.storage.get<Record<string, string>>(K.tokens)) ?? {});
+    if (generation !== this.clientGeneration) throw new WxBotError("upstream", "WeChat session changed during client startup");
+    let health: SessionHealth;
+    try {
+      await c.notifyStart();
+      health = { ok: true, updated_at: Date.now() };
+    } catch (err) {
+      health = { ok: false, updated_at: Date.now(), error: (err as Error).message.slice(0, 500) };
+      // A lifecycle request failing must not silently disable existing polling.
+      // Authentication expiry is different and must still stop this session.
+      if (err instanceof WxBotError && err.kind === "expired") {
+        if (generation === this.clientGeneration) await this.ctx.storage.put(K.expired, new Date().toISOString());
+        throw err;
+      }
+    }
+    if (generation !== this.clientGeneration) throw new WxBotError("upstream", "WeChat session changed during client startup");
+    await this.ctx.storage.put("session_start", health);
+    if (generation !== this.clientGeneration) throw new WxBotError("upstream", "WeChat session changed during client startup");
     this.client = c;
     return c;
+  }
+
+  /** Repair future sends only. Never replay the failed message or alter receipts. */
+  private async recoverSession(): Promise<void> {
+    if (this.sessionRecovery) return this.sessionRecovery;
+    const recovery = this.recoverSessionNow();
+    this.sessionRecovery = recovery;
+    try { await recovery; }
+    finally { if (this.sessionRecovery === recovery) this.sessionRecovery = undefined; }
+  }
+
+  private async recoverSessionNow(): Promise<void> {
+    const previous = await this.ctx.storage.get<SessionHealth>("session_recovery");
+    if (previous && Date.now() - previous.updated_at < SESSION_RECOVERY_COOLDOWN_MS) return;
+    await this.ctx.storage.put("session_recovery", { ok: false, updated_at: Date.now() } satisfies SessionHealth);
+    this.pollAbort?.abort();
+    this.resetClient();
+    try {
+      await this.liveClient();
+      const start = await this.ctx.storage.get<SessionHealth>("session_start");
+      await this.ctx.storage.put("session_recovery", { ok: !!start?.ok, updated_at: Date.now(), ...(start?.error ? { error: start.error } : {}) } satisfies SessionHealth);
+    } catch (err) {
+      await this.ctx.storage.put("session_recovery", { ok: false, updated_at: Date.now(), error: (err as Error).message.slice(0, 500) } satisfies SessionHealth);
+    } finally {
+      // Keep the cursor, verified owner and saved tokens; restart long-polling.
+      if ((await this.session()) && !(await this.ctx.storage.get(K.expired))) await this.ctx.storage.setAlarm(Date.now());
+    }
   }
 
   private async allow(): Promise<Set<string>> {
@@ -145,7 +218,7 @@ export class WxBinding extends DurableObject<Env> {
     await this.ctx.storage.put({ [K.session]: s, [K.tokens]: tokens });
     await this.ctx.storage.delete(K.expired);
     if (cursor !== undefined) await this.ctx.storage.put(K.cursor, cursor);
-    this.client = undefined;
+    this.resetClient();
     this.pollAbort?.abort();
     await this.ctx.storage.setAlarm(Date.now());
   }
@@ -159,6 +232,10 @@ export class WxBinding extends DurableObject<Env> {
       await this.ctx.storage.put("last_send", { state: "sent", updated_at: Date.now() });
     } catch (err) {
       await this.ctx.storage.put("last_send", { state: "failed", updated_at: Date.now(), error: (err as Error).message.slice(0, 500) });
+      if (isPrepareFailure(err)) {
+        // Recovery failure must not replace the original send diagnostic.
+        try { await this.recoverSession(); } catch { /* The original error remains authoritative. */ }
+      }
       throw err;
     }
   }
@@ -208,6 +285,8 @@ export class WxBinding extends DurableObject<Env> {
       context_available: !!(s && tokens[s.ilink_user_id]),
       context_observed_at: (await this.ctx.storage.get<number>("context_observed_at")) ?? null,
       poll_health: (await this.ctx.storage.get<{ ok: boolean; updated_at: number; error?: string }>("poll_health")) ?? null,
+      session_start: (await this.ctx.storage.get<SessionHealth>("session_start")) ?? null,
+      session_recovery: (await this.ctx.storage.get<SessionHealth>("session_recovery")) ?? null,
       bot_id: s ? `${s.ilink_bot_id.slice(0, 4)}…` : "",
       cursor_set: !!(await this.ctx.storage.get(K.cursor)),
       allowlist: [...(await this.allow())].sort(),
@@ -246,7 +325,7 @@ export class WxBinding extends DurableObject<Env> {
       if (path === "/session" && req.method === "DELETE") {
         // Log out: stop polling and forget credentials; the inbox is kept.
         await this.ctx.storage.delete([K.session, K.tokens, K.cursor, K.expired, K.login]);
-        this.client = undefined;
+        this.resetClient();
         this.pollAbort?.abort();
         return json(200, { ok: true });
       }
@@ -369,7 +448,7 @@ export class WxBinding extends DurableObject<Env> {
           saveTokens: (t) => storage.put({ [K.tokens]: t, context_observed_at: Date.now() }),
           markExpired: async () => {
             await storage.put(K.expired, new Date().toISOString());
-            this.client = undefined;
+            this.resetClient();
           },
         },
       });
