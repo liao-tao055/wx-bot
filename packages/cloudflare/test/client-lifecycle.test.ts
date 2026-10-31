@@ -21,7 +21,7 @@ function fixture() {
     transaction(fn: (tx: unknown) => unknown) { return fn(storage); },
   };
   const binding: any = Object.create(WxBinding.prototype);
-  Object.assign(binding, { ctx: { storage }, env: {}, clientGeneration: 0 });
+  Object.assign(binding, { ctx: { storage }, env: {}, clientGeneration: 0, inbox: { stats: () => ({ pending: 0 }) } });
   return { binding, data, alarm: () => alarm };
 }
 async function withFetch(fetcher: FetchLike, run: () => Promise<void>) {
@@ -151,5 +151,28 @@ test("logging out invalidates an in-flight startup and leaves no polling alarm",
     assert.equal(f.binding.client, undefined);
     assert.equal(f.data.get("session"), undefined);
     assert.equal(f.alarm(), null);
+  });
+});
+
+test("a cold health check reports actual lifecycle startup without sending chat content", async () => {
+  const f = fixture(); const paths: string[] = [];
+  await withFetch(async (url) => { paths.push(new URL(String(url)).pathname); return Response.json({ ret: 0 }); }, async () => {
+    const status = await f.binding.status();
+    assert.equal(status.server_version, "0.3.3");
+    assert.equal(status.session_start.ok, true);
+    assert.equal(status.expired, false);
+    await f.binding.status();
+    assert.deepEqual(paths, ["/ilink/bot/msg/notifystart"]);
+    assert.equal(f.data.get("last_send"), undefined);
+  });
+});
+
+test("health checks report lifecycle authentication expiry without another login attempt", async () => {
+  const f = fixture(); let calls = 0;
+  await withFetch(async () => { calls++; return Response.json({ ret: -14 }); }, async () => {
+    const status = await f.binding.status();
+    assert.equal(status.expired, true);
+    assert.equal(status.session_start.ok, false);
+    await f.binding.status(); assert.equal(calls, 1);
   });
 });

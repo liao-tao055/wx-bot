@@ -172,7 +172,7 @@ export class WxBinding extends DurableObject<Env> {
       // A lifecycle request failing must not silently disable existing polling.
       // Authentication expiry is different and must still stop this session.
       if (err instanceof WxBotError && err.kind === "expired") {
-        if (generation === this.clientGeneration) await this.ctx.storage.put(K.expired, new Date().toISOString());
+        if (generation === this.clientGeneration) await this.ctx.storage.put({ [K.expired]: new Date().toISOString(), session_start: health });
         throw err;
       }
     }
@@ -273,7 +273,14 @@ export class WxBinding extends DurableObject<Env> {
     const s = await this.session();
     const cfg = await this.config();
     const counts: InboxCounts | undefined = b ? this.inbox.stats(b) : undefined;
-    const expired = !!(await this.ctx.storage.get(K.expired));
+    let expired = !!(await this.ctx.storage.get(K.expired));
+    // Health checks also initialize a cold client's lifecycle. A healthy poll
+    // or a stored login alone does not establish that startup was re-asserted.
+    // notifyStart sends no message and cannot replay any delivery.
+    if (s && !expired && !this.client) {
+      try { await this.liveClient(); }
+      catch { expired = !!(await this.ctx.storage.get(K.expired)); }
+    }
     const tokens = (await this.ctx.storage.get<Record<string, string>>(K.tokens)) ?? {};
     // A missing alarm must not leave a valid account silently unable to receive
     // the owner's new context. This only wakes polling; it never sends a message.
