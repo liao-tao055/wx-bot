@@ -49,6 +49,27 @@ function fixture() {
   return { env, request, link, rpc, call, state, sent, storage };
 }
 
+test("standing retry discovery and queued results never claim delivery", async () => {
+  const f = fixture(); const url = await f.link();
+  const backend: any = f.env.WXBOT.get(f.env.WXBOT.idFromName("tong"));
+  backend.mcpSendOnce = async () => ({ ok: false, duplicate: false, queued: true, state: "queued", next_retry_at: 123456 });
+  const result = await f.call(url, "wechat_send_text", { delivery_id: "queued-output", text: "authorized result" });
+  expect(result.result.structuredContent).toMatchObject({ ok: false, queued: true, next_retry_at: 123456 });
+  const init = await (await f.rpc(url, "initialize", { protocolVersion: "2025-06-18" })).json();
+  expect(init.result.instructions).toContain("UNTIL SENT");
+  expect(init.result.instructions).toContain("Do not request per-attempt user confirmation");
+});
+
+test("an already retained queued file is not uploaded again", async () => {
+  const f = fixture(); const url = await f.link(); const digest = "a".repeat(64);
+  const fingerprint = await sha256(JSON.stringify(["verified-owner", "", "file.pdf", digest]));
+  const backend: any = f.env.WXBOT.get(f.env.WXBOT.idFromName("tong"));
+  backend.mcpDeliveryStatus = async () => ({ fingerprint, state: "uncertain", updated_at: 1, retry_mode: "until_sent", next_retry_at: 123456 });
+  const result = (await f.call(url, "wechat_prepare_file_upload", { delivery_id: "queued-output", filename: "file.pdf", sha256: digest, size_bytes: 10 })).result.structuredContent;
+  expect(result.queued).toBe(true); expect(result.upload_url).toBeUndefined();
+  expect(result.next_retry_at).toBe(123456); expect(f.sent).toHaveLength(0);
+});
+
 test("connection link needs bearer auth, is binding-scoped, and hides API_TOKEN", async () => {
   const f = fixture();
   expect((await f.request("https://wx.example/b/tong/mcp-link")).status).toBe(401);
@@ -270,7 +291,7 @@ test("status reports context observation and poll health separately from login",
   const f = fixture(); const url = await f.link();
   Object.assign(f.state, { context_available: true, context_observed_at: 12345, poll_health: { ok: false, updated_at: 12350, error: "getupdates HTTP 502" } });
   const status = (await f.call(url, "wechat_status", {})).result.structuredContent;
-  expect(status).toMatchObject({ server_version: "0.3.4", binding_server_version: null, supported_file_types: "any", file_delivery_mode: "native_file", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" }, session_start: null, session_recovery: null });
+  expect(status).toMatchObject({ server_version: "0.4.0", binding_server_version: null, supported_file_types: "any", file_delivery_mode: "native_file", logged_in: true, expired: false, context_available: true, context_observed_at: 12345, poll_health: { ok: false, error: "getupdates HTTP 502" }, session_start: null, session_recovery: null });
 });
 
 test("workspace uploads preserve Office, text, images and arbitrary binary files exactly", async () => {

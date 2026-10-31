@@ -18,6 +18,8 @@ export interface SendRequest {
   text?: string;
   media?: OutgoingMedia;
   caption?: string;
+  /** Internal stable identity for an authorized durable retry job. */
+  clientIdPrefix?: string;
 }
 
 /** The scanned login user is the only wxid that may talk to a binding. */
@@ -42,10 +44,10 @@ export async function sendMessage(client: IlinkClient, allow: Set<string>, req: 
   if (!client.contextTokens.get(req.to)) {
     throw new WxBotError("no_context", `no context_token for ${req.to}: user must message the bot first`);
   }
-  if (req.text !== undefined && req.text !== "") return client.sendText(req.to, req.text);
+  if (req.text !== undefined && req.text !== "") return client.sendText(req.to, req.text, req.clientIdPrefix);
   if (!req.media) throw new WxBotError("bad_request", "one of text, image, file, video is required");
   if (req.media.data.length > MAX_MEDIA_BYTES) throw new WxBotError("too_large", "file too large (>100 MB)");
   const itemType =
     req.media.kind === "image" ? ItemType.Image : req.media.kind === "video" ? ItemType.Video : ItemType.File;
-  await client.sendMedia(req.to, { data: req.media.data, fileName: req.media.fileName, itemType, caption: req.caption });
+  await client.sendMedia(req.to, { data: req.media.data, fileName: req.media.fileName, itemType, caption: req.caption, clientIdPrefix: req.clientIdPrefix });
 }

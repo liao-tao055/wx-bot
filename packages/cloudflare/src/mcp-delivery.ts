@@ -88,17 +88,22 @@ export async function deliverOnce(
   try {
     await send();
   } catch (err) {
-    if (!receipt.manual_reviews && err instanceof WxBotError && ["bad_request", "forbidden", "no_context", "too_large", "expired"].includes(err.kind)) {
-      await storage.delete(key); // Validation/iLink rejection: no delivery occurred.
-    } else {
-      // A reviewed legacy record must never lose its original fingerprint,
-      // including when the one authorized retry fails a precondition.
-      await storage.put(key, { ...receipt, state: "uncertain", updated_at: Date.now() } satisfies DeliveryReceipt);
-    }
+    await storage.transaction(async tx => {
+      const current = await tx.get<DeliveryReceipt>(key);
+      // An old timed-out attempt must never downgrade a later successful send.
+      if (!current || current.state !== "sending" || current.updated_at !== receipt.updated_at || current.fingerprint !== fingerprint) return;
+      if (!receipt.manual_reviews && err instanceof WxBotError && ["bad_request", "forbidden", "no_context", "too_large", "expired"].includes(err.kind)) {
+        await tx.delete(key);
+      } else await tx.put(key, { ...receipt, state: "uncertain", updated_at: Date.now() } satisfies DeliveryReceipt);
+    });
     throw err;
   }
   // A storage error here deliberately leaves "sending", preventing a duplicate.
-  await storage.put(key, { ...receipt, state: "sent", updated_at: Date.now() } satisfies DeliveryReceipt);
+  await storage.transaction(async tx => {
+    const current = await tx.get<DeliveryReceipt>(key);
+    if (current && current.fingerprint !== fingerprint) throw new WxBotError("bad_request", "Delivery content changed during send");
+    await tx.put(key, { ...receipt, state: "sent", updated_at: Date.now() } satisfies DeliveryReceipt);
+  });
   const records = await storage.list<DeliveryReceipt>({ prefix: PREFIX, limit: 512 });
   const expired = [...records].filter(([, r]) => Date.now() - r.updated_at >= RETENTION).map(([k]) => k);
   if (expired.length) await storage.delete(expired);

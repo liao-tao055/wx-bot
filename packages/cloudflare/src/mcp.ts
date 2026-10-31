@@ -8,10 +8,10 @@ const enc = new TextEncoder();
 const BINDING = /^[a-z0-9_-]{1,32}$/;
 const VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
-export const MCP_SERVER_VERSION = "0.3.4";
+export const MCP_SERVER_VERSION = "0.4.0";
 const SERVER = { name: "wx-bot-personal", version: MCP_SERVER_VERSION };
-const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text. Use stable delivery_id values (task + scheduled time + filename) to avoid duplicates for seven days. Any file format is supported as a native file attachment, including PDF, ZIP, Word, Excel, PowerPoint, text, and images; each file is at most 10 MiB. wechat_send_file requires the host-converted file object, NOT a local path string. For local workspace files when host conversion is unavailable, use wechat_prepare_file_upload, then PUT exact local bytes to its short-lived upload_url. A successful PUT sends the file; do not send it again through another route. Never expose connection or upload URLs in chat. Report errors here, not in WeChat. no_context requires a new user message to ClawBot; expired requires re-login. Never retry uncertain delivery automatically.";
-const REVIEW_INSTRUCTIONS = " Only after the user explicitly checks WeChat, confirms non-receipt, and authorizes one retry, call wechat_confirm_not_received using the latest delivery status timestamp. A greeting, elapsed time, and the absence of a sent receipt are not consent. Then retry the same delivery_id and identical content exactly once. Never create a new ID to bypass uncertainty.";
+const INSTRUCTIONS = "Send only user-authorized task output to this binding's verified WeChat owner. Use plain text and stable delivery_id values (task + scheduled time + filename). The owner has enabled standing server-side retry UNTIL SENT for new deliveries: retain the exact payload, retry with backoff, and stop permanently for that ID when sent is recorded. Do not request per-attempt user confirmation for enrolled jobs. A queued=true result is retained for automatic cloud retry, not delivered; report sent only when ok=true or state=sent. Do not repeatedly upload or send an already queued job from the host; inspect wechat_delivery_status instead. Active attempts are leased and ambiguous failures wait at least 120 seconds; stable client IDs reduce but cannot eliminate late duplicate risk already acknowledged by the owner. Any native file format up to 10 MiB is supported. wechat_send_file requires the host-converted file object. For local files without conversion, use wechat_prepare_file_upload then PUT exact bytes. Never expose connection or upload URLs. Report errors here, not in WeChat. no_context waits for a new owner message; expired requires re-login, while retained jobs remain pending.";
+const REVIEW_INSTRUCTIONS = " Legacy uncertain records created before the standing policy are not automatically enrolled. Only after the owner explicitly confirms non-receipt and authorizes retry, call wechat_confirm_not_received with the latest status timestamp, then submit the original ID and identical content once to enroll it in until-sent retry. No repeated confirmation is needed after enrollment. Never unlock sent or active records, change a payload, or create a new ID to evade deduplication.";
 
 const textProp = (description: string, maxLength: number) => ({ type: "string", description, minLength: 1, maxLength });
 const common = {
@@ -32,15 +32,15 @@ const TOOLS = [
     name: "wechat_prepare_file_upload", description: "Upload any authorized local workspace file (PDF, ZIP, Word, Excel, PowerPoint, text, images, or other binary files) when host file conversion is unavailable. Obtain a 5-minute PUT URL and upload exact bytes from the execution environment. A successful PUT sends the native WeChat file attachment. No phone transfer is needed.",
     inputSchema: { type: "object", properties: { ...common, filename: textProp("Original attachment basename, including its extension if present; no directory separators.", 180), size_bytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES }, sha256: { type: "string", pattern: "^[a-fA-F0-9]{64}$", description: "Compute from the exact local file bytes." } }, required: ["delivery_id", "filename", "size_bytes", "sha256"], additionalProperties: false }, annotations: { ...writeAnnotations, openWorldHint: false },
   },
-  { name: "wechat_delivery_status", description: "Check a stable delivery_id after a timeout. A pending/uncertain delivery must be reviewed in WeChat, not automatically resent.", inputSchema: { type: "object", properties: { delivery_id: common.delivery_id }, required: ["delivery_id"], additionalProperties: false }, annotations: readAnnotations },
+  { name: "wechat_delivery_status", description: "Check sent/queued status, attempts, and the next automatic retry time. Enrolled until-sent jobs need no repeated user confirmation or host resend.", inputSchema: { type: "object", properties: { delivery_id: common.delivery_id }, required: ["delivery_id"], additionalProperties: false }, annotations: readAnnotations },
   {
     name: "wechat_confirm_not_received",
-    description: "After the owner explicitly checks WeChat, confirms this item was not received, and authorizes ONE same-ID same-content retry, arm that retry. Does not send anything. Never use automatically; sent or in-progress items cannot be unlocked.",
+    description: "One-time enrollment review for a legacy uncertain delivery after the owner checks WeChat, confirms non-receipt, and authorizes until-sent retry. Does not send anything. Next submit the original same-ID same-content payload once; the server then retries automatically until sent. Sent or in-progress items cannot be unlocked.",
     inputSchema: { type: "object", properties: {
       delivery_id: common.delivery_id,
       expected_updated_at: { type: "integer", minimum: 1, description: "Exact updated_at from the latest wechat_delivery_status result." },
       user_confirmed_not_received: { type: "boolean", const: true, description: "True only after the user actually checks WeChat and explicitly confirms non-receipt of this item." },
-      user_authorized_retry: { type: "boolean", const: true, description: "True only after the user explicitly authorizes one retry, acknowledging possible duplicates if the old request completes late." },
+      user_authorized_retry: { type: "boolean", const: true, description: "True only after the user explicitly authorizes retry, acknowledging possible late duplicates; following submission enrolls the original content in standing until-sent retry." },
     }, required: ["delivery_id", "expected_updated_at", "user_confirmed_not_received", "user_authorized_retry"], additionalProperties: false },
     annotations: { ...writeAnnotations, openWorldHint: false },
   },
@@ -178,7 +178,7 @@ async function sendFile(env: Env, binding: string, to: string, id: string, title
   const digest = await sha256(data);
   const fingerprint = await sha256(JSON.stringify([to, title, name, digest]));
   const result = await stub(env, binding).mcpSendOnce(id, fingerprint, { to, caption: caption(title), media: { kind: "file", fileName: name, data } });
-  return { ok: result.ok, duplicate: result.duplicate };
+  return { ...result };
 }
 async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: string): Promise<Obj> {
   if (name === "wechat_status") {
@@ -188,23 +188,26 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
       context_available: st.context_available ?? false, context_observed_at: st.context_observed_at ?? null, poll_health: st.poll_health ?? null,
       poll_health_age_ms: st.poll_health_age_ms ?? null, poller_running: st.poller_running ?? false, poll_alarm_at: st.poll_alarm_at ?? null,
       poll_alarm_health: st.poll_alarm_health ?? null, last_inbound_at: st.last_inbound_at ?? null,
-      session_start: st.session_start ?? null, session_recovery: st.session_recovery ?? null };
+      session_start: st.session_start ?? null, session_recovery: st.session_recovery ?? null,
+      retry_policy: st.retry_policy ?? null, retry_queue: st.retry_queue ?? null };
   }
   const id = str(a.delivery_id, "delivery_id", 200);
   if (name === "wechat_delivery_status") {
     const r = await stub(env, binding).mcpDeliveryStatus(id);
-    return { delivery_id: id, state: r?.state ?? "not_found", updated_at: r?.updated_at ?? null };
+    return { delivery_id: id, state: r?.state ?? "not_found", updated_at: r?.updated_at ?? null,
+      retry_mode: r && "retry_mode" in r ? r.retry_mode : null, retry_attempts: r && "retry_attempts" in r ? r.retry_attempts : null,
+      next_retry_at: r && "next_retry_at" in r ? r.next_retry_at : null, waiting_context: r && "waiting_context" in r ? r.waiting_context : false };
   }
   const to = await owner(env, binding);
   if (name === "wechat_confirm_not_received") {
     const r = await stub(env, binding).mcpConfirmNotReceived(id, a.expected_updated_at as number, a.user_confirmed_not_received === true, a.user_authorized_retry === true);
-    return { delivery_id: id, state: r.state, updated_at: r.updated_at, retry_ready: true, sent: false, instructions: "Retry the original delivery_id and identical content once. No message has been sent by this confirmation." };
+    return { delivery_id: id, state: r.state, updated_at: r.updated_at, retry_ready: true, sent: false, instructions: "Submit the original delivery_id and identical content once to enroll in automatic until-sent retry. No message has been sent by this review." };
   }
   const title = taskTitle(a.task_title);
   if (name === "wechat_send_text") {
     const text = str(a.text, "text", 12000);
     const result = await stub(env, binding).mcpSendOnce(id, await sha256(JSON.stringify([to, title, text])), { to, text: title ? `${caption(title)}\n${text}` : text });
-    return { ok: result.ok, duplicate: result.duplicate };
+    return { ...result };
   }
   const fileName = filename(a.filename);
   if (name === "wechat_send_file") {
@@ -222,6 +225,7 @@ async function tool(env: Env, binding: string, name: unknown, a: Obj, origin: st
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new HttpError(400, "delivery_id was already used for different content");
       if (previous.state === "sent") return { ok: true, duplicate: true, already_sent: true, delivery_id: id, state: "sent" };
+      if ("retry_mode" in previous && previous.retry_mode === "until_sent") return { ok: false, queued: true, delivery_id: id, state: previous.state, next_retry_at: previous.next_retry_at, instructions: "The exact file is already retained for automatic until-sent retry. Do not upload or send it again." };
       if (previous.state !== "retry_ready") throw new WxBotError("upstream", "Delivery is pending or uncertain. Check WeChat and wechat_delivery_status; do not resend automatically.");
     }
     const expires = Date.now() + 5 * 60_000;

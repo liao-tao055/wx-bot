@@ -1,5 +1,7 @@
 # ChatGPT 个人微信推送
 
+> 当前个人 MCP 0.4.0 已按本人授权启用[云端持续重试直到 sent](wechat-until-sent.md)。以下一次人工重试规则仅适用于旧版未加入队列的记录；新队列任务不需要逐次确认，调用方也不重复上传。
+
 在已经部署的 Cloudflare Worker 上增加个人 MCP 接口。沿用现有 `WXBOT`
 Durable Object 和 `API_TOKEN`，不需要新的数据库、API 模型付费账号或常开的手机。
 现有登录、收发和健康检查接口保留。

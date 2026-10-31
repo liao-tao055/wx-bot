@@ -19,7 +19,8 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { handleMcpRequest, MCP_SERVER_VERSION } from "./mcp.ts";
-import { confirmNotReceived, deliverOnce, readDelivery } from "./mcp-delivery.ts";
+import { confirmNotReceived, readDelivery } from "./mcp-delivery.ts";
+import { queueDelivery, deliveryRetryStatus, retryQueueStatus, runDueRetry, wakeContextRetries, RETRY_POLICY } from "./mcp-retry.ts";
 import {
   allowlist,
   createApiHandler,
@@ -241,11 +242,15 @@ export class WxBinding extends DurableObject<Env> {
   }
 
   async mcpSendOnce(id: string, fingerprint: string, req: Omit<SendRequest, "binding">) {
-    return deliverOnce(this.ctx.storage, id, fingerprint, () => this.send(req));
+    const result = await queueDelivery(this.ctx.storage, id, fingerprint, req, request => this.send(request));
+    if (result.queued) await this.ctx.storage.setAlarm(Date.now());
+    return result;
   }
 
   async mcpDeliveryStatus(id: string) {
-    return readDelivery(this.ctx.storage, id);
+    const receipt = await readDelivery(this.ctx.storage, id);
+    const retry = await deliveryRetryStatus(this.ctx.storage, id);
+    return receipt ? { ...receipt, ...(retry ?? {}) } : retry ? { ...retry, state: "queued" as const } : undefined;
   }
 
   async mcpConfirmNotReceived(id: string, updatedAt: number, confirmed: boolean, authorized: boolean) {
@@ -306,6 +311,8 @@ export class WxBinding extends DurableObject<Env> {
       last_inbound_at: (await this.ctx.storage.get<number>("last_inbound_at")) ?? null,
       session_start: (await this.ctx.storage.get<SessionHealth>("session_start")) ?? null,
       session_recovery: (await this.ctx.storage.get<SessionHealth>("session_recovery")) ?? null,
+      retry_policy: RETRY_POLICY,
+      retry_queue: await retryQueueStatus(this.ctx.storage),
       bot_id: s ? `${s.ilink_bot_id.slice(0, 4)}…` : "",
       cursor_set: !!(await this.ctx.storage.get(K.cursor)),
       allowlist: [...(await this.allow())].sort(),
@@ -478,7 +485,7 @@ export class WxBinding extends DurableObject<Env> {
         onHealth: (health) => this.ctx.waitUntil(storage.put("poll_health", {
           ...health, updated_at: Date.now(),
         }).catch(() => {})),
-        onQueued: async () => { await storage.put("last_inbound_at", Date.now()); },
+        onQueued: async () => { await storage.put("last_inbound_at", Date.now()); await wakeContextRetries(storage); },
         log: (level, msg) => console[level === "info" ? "log" : level](`[${name}] ${msg}`),
         store: {
           loadCursor: async () => (await storage.get<string>(K.cursor)) ?? "",
@@ -494,6 +501,7 @@ export class WxBinding extends DurableObject<Env> {
     }
     const cfg = await this.config();
     if (cfg.delivery === "webhook" && cfg.webhook?.url) tasks.push(this.deliverLoop(name, cfg.webhook, ctl.signal));
+    if (client || (await retryQueueStatus(this.ctx.storage)).pending) tasks.push(this.retryLoop(ctl.signal));
 
     try {
       const results = await Promise.allSettled(tasks);
@@ -507,7 +515,19 @@ export class WxBinding extends DurableObject<Env> {
     const login = await this.ctx.storage.get<LoginState>(K.login);
     const pending = cfg.delivery === "webhook" && this.inbox.stats(name).pending > 0;
     if ((await this.session()) && !(await this.ctx.storage.get(K.expired))) await this.ctx.storage.setAlarm(Date.now());
-    else if (login?.status === "waiting" || pending) await this.ctx.storage.setAlarm(Date.now() + 1000);
+    else if (login?.status === "waiting" || pending || (await retryQueueStatus(this.ctx.storage)).pending) await this.ctx.storage.setAlarm(Date.now() + 1000);
+  }
+
+  private async retryLoop(signal: AbortSignal) {
+    while (!signal.aborted) {
+      await runDueRetry(this.ctx.storage, request => this.send(request));
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(done, 10_000);
+        function done() { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); }
+        signal.addEventListener("abort", done, { once: true });
+        if (signal.aborted) done();
+      });
+    }
   }
 
   private async deliverLoop(name: string, webhook: WebhookConfig, signal: AbortSignal) {

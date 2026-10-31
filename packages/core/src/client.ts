@@ -40,6 +40,7 @@ export interface MediaToSend {
   fileName: string;
   itemType: number;
   caption?: string;
+  clientIdPrefix?: string;
 }
 
 const UPLOAD_TIMEOUT_MS = 5 * 60_000;
@@ -137,9 +138,10 @@ export class IlinkClient {
   }
 
   /** Send text, split into MAX_TEXT_RUNES chunks. */
-  async sendText(wxid: string, text: string): Promise<void> {
+  async sendText(wxid: string, text: string, clientIdPrefix?: string): Promise<void> {
+    let index = 0;
     for (const chunk of splitText(text, MAX_TEXT_RUNES)) {
-      await this.sendItem(wxid, { type: ItemType.Text, text_item: { text: chunk } });
+      await this.sendItem(wxid, { type: ItemType.Text, text_item: { text: chunk } }, clientIdPrefix ? `${clientIdPrefix}-${index++}` : undefined);
     }
   }
 
@@ -164,8 +166,8 @@ export class IlinkClient {
         file_item: { media, file_name: baseName(m.fileName), len: String(m.data.length) },
       };
     }
-    if (m.caption) await this.sendItem(wxid, { type: ItemType.Text, text_item: { text: m.caption } });
-    await this.sendItem(wxid, item);
+    if (m.caption) await this.sendItem(wxid, { type: ItemType.Text, text_item: { text: m.caption } }, m.clientIdPrefix ? `${m.clientIdPrefix}-c` : undefined);
+    await this.sendItem(wxid, item, m.clientIdPrefix ? `${m.clientIdPrefix}-m` : undefined);
   }
 
   /** Download and decrypt one CDN media item. */
@@ -228,13 +230,13 @@ export class IlinkClient {
     throw withAttemptCount(lastErr, attempts);
   }
 
-  private async sendItem(wxid: string, item: MessageItem): Promise<void> {
-    const pending = this.sendTail.then(() => this.sendItemNow(wxid, item));
+  private async sendItem(wxid: string, item: MessageItem, clientId?: string): Promise<void> {
+    const pending = this.sendTail.then(() => this.sendItemNow(wxid, item, clientId));
     this.sendTail = pending.catch(() => {});
     return pending;
   }
 
-  private async sendItemNow(wxid: string, item: MessageItem): Promise<void> {
+  private async sendItemNow(wxid: string, item: MessageItem, clientId?: string): Promise<void> {
     const token = this.contextTokens.get(wxid) ?? "";
     const useTokenless = !!token && this.tokenlessFor.get(wxid) === token;
     const msg = {
@@ -242,7 +244,7 @@ export class IlinkClient {
         // bot; the outbound from_user_id field is intentionally empty.
         from_user_id: "",
         to_user_id: wxid,
-        client_id: `wxbot-${toHex(randomBytes(8))}`,
+        client_id: clientId ?? `wxbot-${toHex(randomBytes(8))}`,
         message_type: 2,
         message_state: 2,
         item_list: [item],

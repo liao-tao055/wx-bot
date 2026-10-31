@@ -18,6 +18,7 @@ function fixture() {
     async getAlarm() { return alarm; },
     async setAlarm(value: number) { alarm = value; },
     async deleteAlarm() { alarm = null; },
+    async list({ prefix }: { prefix: string }) { return new Map([...data].filter(([key]) => key.startsWith(prefix))); },
     transaction(fn: (tx: unknown) => unknown) { return fn(storage); },
   };
   const binding: any = Object.create(WxBinding.prototype);
@@ -100,13 +101,13 @@ test("explicit prepare rejection repairs the session but never replays the faile
     assert.ok(String(url).endsWith("sendmessage")); sends++;
     return Response.json({ ret: -2, errmsg: "prepare failed" });
   }, async () => {
-    await assert.rejects(f.binding.mcpSendOnce("original-id", "original-fingerprint", { to: "owner", text: "one" }), /prepare failed/);
+    assert.equal((await f.binding.mcpSendOnce("original-id", "original-fingerprint", { to: "owner", text: "one" })).queued, true);
     assert.equal(starts, 2); assert.equal(sends, 2); // Original + existing one-shot token fallback, no third send.
     assert.equal(aborted, true); assert.ok(f.alarm());
     assert.equal(f.data.get("session_recovery").ok, true);
     const receipt = await f.binding.mcpDeliveryStatus("original-id");
     assert.equal(receipt.state, "uncertain"); assert.equal(receipt.fingerprint, "original-fingerprint");
-    await assert.rejects(f.binding.mcpSendOnce("original-id", "original-fingerprint", { to: "owner", text: "one" }), /uncertain/);
+    assert.equal((await f.binding.mcpSendOnce("original-id", "original-fingerprint", { to: "owner", text: "one" })).queued, true);
     assert.equal(sends, 2);
     assert.deepEqual(f.data.get("session"), session);
     assert.deepEqual(f.data.get("context_tokens"), { owner: "old-context" });
@@ -158,7 +159,7 @@ test("a cold health check reports actual lifecycle startup without sending chat 
   const f = fixture(); const paths: string[] = [];
   await withFetch(async (url) => { paths.push(new URL(String(url)).pathname); return Response.json({ ret: 0 }); }, async () => {
     const status = await f.binding.status();
-    assert.equal(status.server_version, "0.3.4");
+    assert.equal(status.server_version, "0.4.0");
     assert.equal(status.session_start.ok, true);
     assert.equal(status.expired, false);
     await f.binding.status();
